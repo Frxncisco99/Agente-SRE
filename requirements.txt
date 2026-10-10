@@ -1,0 +1,10 @@
+# Early Warning System (EWS) — Dependencies
+# Python 3.10+ required
+
+# Core
+numpy>=1.24.0
+requests>=2.31.0
+
+# LLM Providers (install the one you need)
+google-genai>=1.0.0       # For Google Gemini
+# openai>=1.0.0           # For OpenAI GPT (uncomment if needed)
