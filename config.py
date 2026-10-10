@@ -96,7 +96,8 @@ LLM_CONFIDENCE_THRESHOLD: Final[float] = 0.75
 # ──────────────────────────────────────────────────────────────────────
 N8N_WEBHOOK_URL: Final[str] = os.environ.get(
     "N8N_WEBHOOK_URL",
-    "https://your-n8n-instance.app/webhook/ews-alert"
+    "https://frxncisco99.app.n8n.cloud/webhook/ews-alert"
+    
 )
 N8N_WEBHOOK_TIMEOUT: Final[int] = 10     # seconds
 N8N_WEBHOOK_RETRIES: Final[int] = 3

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from config import DATASET_BASE, TENANTS
+from config import DATASET_BASE, TENANTS, LLM_CONFIDENCE_THRESHOLD
 from models import DetectedAnomaly, MetricPoint, VerifiedAlert
 from streaming_simulator import stream_metrics, stream_corrida
 from trend_analyzer import TrendAnalyzer
@@ -44,6 +44,7 @@ sim_state = {
         "anomalies": 0,
         "real": 0,
         "decoys": 0,
+        "dispatched": 0,
         "lead_time": "755 min (avg)"
     }
 }
@@ -414,7 +415,8 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(HTML_PAGE.encode("utf-8"))
+            dashboard_path = Path(__file__).with_name("dashboard.html")
+            self.wfile.write(dashboard_path.read_text(encoding="utf-8").encode("utf-8"))
         elif parsed.path == "/api/state":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -435,23 +437,39 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/api/control":
+        if parsed.path in ("/api/control", "/api/lora-alert"):
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length)
             try:
                 data = json.loads(body.decode("utf-8"))
-                action = data.get("action")
                 with state_lock:
-                    if action == "toggle":
-                        sim_state["paused"] = data.get("paused", not sim_state["paused"])
-                    elif action == "set_speed":
-                        sim_state["speed"] = max(1, min(300, int(data.get("speed", 50))))
-                    elif action == "set_tenant":
-                        sim_state["tenant"] = data.get("tenant", "gracko")
-                    elif action == "set_corrida":
-                        sim_state["corrida"] = int(data.get("corrida", 0))
-                    elif action == "restart":
-                        stop_event.set()  # signals background thread to restart
+                    if parsed.path == "/api/lora-alert":
+                        sim_state["anomalies"].append({
+                            "timestamp": data.get("timestamp", datetime.now().isoformat()),
+                            "description": data.get("description", "Alerta recibida por LoRa"),
+                            "type": data.get("type", "lora_alert"),
+                            "score": float(data.get("score", 1.0)),
+                            "verdict": {
+                                "is_real_incident": True,
+                                "confidence": float(data.get("confidence", 0.95)),
+                                "reasoning": data.get("reasoning", "Alerta recibida desde un dispositivo LoRa real."),
+                            },
+                        })
+                        sim_state["anomalies"] = sim_state["anomalies"][-25:]
+                        sim_state["stats"]["anomalies"] += 1
+                        sim_state["stats"]["real"] += 1
+                    else:
+                        action = data.get("action")
+                        if action == "toggle":
+                            sim_state["paused"] = data.get("paused", not sim_state["paused"])
+                        elif action == "set_speed":
+                            sim_state["speed"] = max(1, min(300, int(data.get("speed", 50))))
+                        elif action == "set_tenant":
+                            sim_state["tenant"] = data.get("tenant", "gracko")
+                        elif action == "set_corrida":
+                            sim_state["corrida"] = int(data.get("corrida", 0))
+                        elif action == "restart":
+                            stop_event.set()  # signals background thread to restart
             except Exception as e:
                 logger.error("Control API error: %s", e)
 
@@ -483,12 +501,14 @@ def simulation_worker():
                 "anomalies": 0,
                 "real": 0,
                 "decoys": 0,
+                "dispatched": 0,
                 "lead_time": "755 min (avg)"
             }
 
         logger.info("▶ Dashboard simulator started for tenant: %s (corrida=%s)", tenant, corrida or "base")
         analyzer = TrendAnalyzer()
         context_filter = create_context_filter(provider="offline", corrida_num=corrida if corrida > 0 else None)
+        dispatcher = WebhookDispatcher(dry_run=False)
 
         try:
             if corrida > 0:
@@ -542,6 +562,24 @@ def simulation_worker():
                             "verdict": verdict.to_dict()
                         })
 
+                        # Send only confirmed incidents, matching main.py behavior.
+                        if verdict.is_real_incident and verdict.confidence >= LLM_CONFIDENCE_THRESHOLD:
+                            alert = VerifiedAlert(
+                                tenant_id=a.tenant_id,
+                                timestamp=a.timestamp,
+                                anomaly_type=a.anomaly_type,
+                                severity=a.severity,
+                                anomaly_score=a.score,
+                                llm_confidence=verdict.confidence,
+                                llm_reasoning=verdict.reasoning,
+                                description=a.description,
+                            )
+                            threading.Thread(
+                                target=_dispatch_dashboard_alert,
+                                args=(dispatcher, alert),
+                                daemon=True,
+                            ).start()
+
                 # Regulate speed
                 speed = sim_state["speed"]
                 time.sleep(1.0 / max(1, speed))
@@ -549,6 +587,13 @@ def simulation_worker():
         except Exception as exc:
             logger.error("Simulation loop error: %s", exc)
             time.sleep(1)
+
+
+def _dispatch_dashboard_alert(dispatcher: WebhookDispatcher, alert: VerifiedAlert) -> None:
+    """Dispatch without blocking the live telemetry loop on n8n latency."""
+    if dispatcher.dispatch(alert):
+        with state_lock:
+            sim_state["stats"]["dispatched"] += 1
 
 
 def start_dashboard(port: int = 8080):

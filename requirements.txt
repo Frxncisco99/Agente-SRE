@@ -4,6 +4,7 @@
 # Core
 numpy>=1.24.0
 requests>=2.31.0
+pyserial>=3.5
 
 # LLM Providers (install the one you need)
 google-genai>=1.0.0       # For Google Gemini
