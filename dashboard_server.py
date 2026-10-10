@@ -26,8 +26,11 @@ from streaming_simulator import stream_metrics, stream_corrida
 from trend_analyzer import TrendAnalyzer
 from llm_context_filter import create_context_filter
 from n8n_webhook_trigger import WebhookDispatcher
+from remediation import build_remediation
+from alert_store import init_db, list_alerts, save_alert
 
 logger = logging.getLogger("ews_dashboard")
+init_db()
 
 # Global simulation state
 sim_state = {
@@ -424,16 +427,24 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             with state_lock:
                 # Return snapshot of recent 60 history points
+                stored_alerts = list_alerts(sim_state["tenant"], 25)
                 payload = {
                     "tenant": sim_state["tenant"],
                     "stats": sim_state["stats"],
                     "current_point": sim_state["current_point"],
                     "history": sim_state["history"][-60:],
-                    "anomalies": sim_state["anomalies"][-25:]
+                    "anomalies": sim_state["anomalies"][-25:] or stored_alerts
                 }
             self.wfile.write(json.dumps(payload).encode("utf-8"))
         else:
             self.send_error(404, "Not Found")
+
+    def do_OPTIONS(self) -> None:
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -444,9 +455,12 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
                 data = json.loads(body.decode("utf-8"))
                 with state_lock:
                     if parsed.path == "/api/lora-alert":
-                        sim_state["anomalies"].append({
+                        remediation = data.get("remediation") or build_remediation(data.get("type", "lora_alert"), data.get("description", ""), data.get("reasoning", ""))
+                        alert_record = {
+                            "tenant_id": data.get("tenant_id", "lora_real"),
                             "timestamp": data.get("timestamp", datetime.now().isoformat()),
-                            "description": data.get("description", "Alerta recibida por LoRa"),
+                            "description": f"{data.get('description', 'Alerta recibida por LoRa')} — Sugerencia: {remediation}",
+                            "remediation": remediation,
                             "type": data.get("type", "lora_alert"),
                             "source_device": data.get("source_device", "Desconocido"),
                             "temperature": data.get("temperature"),
@@ -456,7 +470,9 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
                                 "confidence": float(data.get("confidence", 0.95)),
                                 "reasoning": data.get("reasoning", "Alerta recibida desde un dispositivo LoRa real."),
                             },
-                        })
+                        }
+                        sim_state["anomalies"].append(alert_record)
+                        save_alert(alert_record)
                         sim_state["anomalies"] = sim_state["anomalies"][-25:]
                         sim_state["stats"]["anomalies"] += 1
                         sim_state["stats"]["real"] += 1
@@ -478,8 +494,15 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
+        elif parsed.path in ("/api/control", "/api/lora-alert") and self.command == "OPTIONS":
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
         else:
             self.send_error(404, "Not Found")
 
@@ -568,13 +591,18 @@ def simulation_worker():
                         else:
                             sim_state["stats"]["decoys"] += 1
 
-                        sim_state["anomalies"].append({
+                        remediation = build_remediation(a.anomaly_type.value, a.description, verdict.reasoning)
+                        alert_record = {
+                            "tenant_id": a.tenant_id,
                             "timestamp": a.timestamp.isoformat(),
-                            "description": a.description,
+                            "description": f"{a.description} — Sugerencia: {remediation}",
                             "type": a.anomaly_type.value,
                             "score": a.score,
+                            "remediation": remediation,
                             "verdict": verdict.to_dict()
-                        })
+                        }
+                        sim_state["anomalies"].append(alert_record)
+                        save_alert(alert_record)
 
                         # Send only confirmed incidents, matching main.py behavior.
                         if verdict.is_real_incident and verdict.confidence >= LLM_CONFIDENCE_THRESHOLD:
@@ -587,6 +615,7 @@ def simulation_worker():
                                 llm_confidence=verdict.confidence,
                                 llm_reasoning=verdict.reasoning,
                                 description=a.description,
+                                remediation=remediation,
                             )
                             pending_alerts.append(alert)
 

@@ -20,40 +20,65 @@ from datetime import datetime
 import requests
 
 from config import N8N_WEBHOOK_URL, N8N_WEBHOOK_TIMEOUT
+from remediation import build_remediation
 
 logger = logging.getLogger("lora_bridge")
 
 
 def parse_alert(line: str) -> dict | None:
-    """Parse ALERTA_SERVER|source|message|temperature lines."""
-    parts = line.strip().split("|", 3)
-    if len(parts) != 4 or parts[0] != "ALERTA_SERVER":
+    """Parse the new DATOS_SERVER|id|cpu|ram|disco|latencia|errores protocol."""
+    parts = line.strip().split("|")
+    if len(parts) < 7 or parts[0] != "DATOS_SERVER":
         return None
-    source, message, raw_temperature = parts[1:]
+
     try:
-        temperature = float(raw_temperature)
-    except ValueError:
-        temperature = None
-    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    lower = message.lower()
-    if "cpu" in lower or "proceso" in lower or "satur" in lower:
+        source = parts[1]
+        cpu, ram, disco = (float(parts[2]), float(parts[3]), float(parts[4]))
+        latency = float(parts[5])
+        errors = float(parts[6])
+    except (ValueError, IndexError):
+        logger.warning("Métrica LoRa inválida: %s", line)
+        return None
+
+    # Match the receiver's policy: notifications are suppressed during peak hours.
+    now = datetime.now().astimezone()
+    if 8 <= now.hour < 18:
+        return None
+    if cpu < 90.0 and latency <= 100.0 and errors <= 0.0:
+        return None
+
+    if cpu >= 90.0:
         anomaly_type = "resource_exhaustion"
-    elif "latencia" in lower or "error" in lower or "red" in lower:
-        anomaly_type = "error_burst"
+        message = "CPU del servidor en estado crítico"
+    elif latency > 100.0:
+        anomaly_type = "resource_exhaustion"
+        message = "Latencia del servidor fuera de rango"
     else:
-        anomaly_type = "lora_alert"
-    temp_text = f"Temperatura/valor reportado: {temperature:.1f}" if temperature is not None else "Sin valor numérico"
+        anomaly_type = "error_burst"
+        message = "Errores de sistema detectados"
+
+    description = (
+        f"{source}: {message}. CPU={cpu:.1f}%, RAM={ram:.1f}%, "
+        f"Disco={disco:.1f}%, Latencia={latency:.0f}ms, Errores={errors:.0f}"
+    )
+    remediation = build_remediation(anomaly_type, description)
     return {
         "tenant_id": "lora_real",
-        "timestamp": timestamp,
+        "timestamp": now.isoformat(timespec="seconds"),
         "anomaly_type": anomaly_type,
         "severity": "critical",
         "anomaly_score": 1.0,
         "llm_confidence": 0.95,
-        "llm_reasoning": f"Alerta confirmada por dispositivo LoRa {source}.",
-        "description": f"{source}: {message}. {temp_text}",
+        "llm_reasoning": f"Alerta confirmada por métricas LoRa de {source} fuera de horario pico.",
+        "description": description,
+        "remediation": remediation,
         "source_device": source,
-        "temperature": temperature,
+        "temperature": None,
+        "cpu": cpu,
+        "ram": ram,
+        "disco": disco,
+        "latencia_ms": latency,
+        "errores": errors,
     }
 
 
@@ -86,6 +111,8 @@ def update_dashboard(payload: dict) -> None:
             "confidence": payload["llm_confidence"],
             "description": payload["description"],
             "reasoning": payload["llm_reasoning"],
+            "remediation": payload["remediation"],
+            "tenant_id": payload["tenant_id"],
             "source_device": payload["source_device"],
             "temperature": payload["temperature"],
         }, timeout=2)

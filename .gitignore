@@ -36,3 +36,7 @@ output/
 # Large datasets / unpacked zips (opcional mantener el código limpio)
 # Descomentar si no se desea subir el zip/carpetas de corridas pesadas
 zikit-dataset/
+
+# Runtime persistence and temporary Office lock files
+centinel_alerts.db
+~$*.docx

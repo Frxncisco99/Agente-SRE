@@ -135,6 +135,7 @@ class VerifiedAlert:
     llm_confidence: float
     llm_reasoning: str
     description: str
+    remediation: str = ""
     dispatched: bool = False
     dispatch_status_code: int | None = None
 
@@ -149,4 +150,5 @@ class VerifiedAlert:
             "llm_confidence": round(self.llm_confidence, 4),
             "llm_reasoning": self.llm_reasoning,
             "description": self.description,
+            "remediation": self.remediation,
         }
