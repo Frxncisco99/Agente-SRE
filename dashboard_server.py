@@ -15,7 +15,7 @@ import logging
 import threading
 import time
 from datetime import datetime
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -448,6 +448,8 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
                             "timestamp": data.get("timestamp", datetime.now().isoformat()),
                             "description": data.get("description", "Alerta recibida por LoRa"),
                             "type": data.get("type", "lora_alert"),
+                            "source_device": data.get("source_device", "Desconocido"),
+                            "temperature": data.get("temperature"),
                             "score": float(data.get("score", 1.0)),
                             "verdict": {
                                 "is_real_incident": True,
@@ -466,6 +468,7 @@ class DashboardRequestHandler(SimpleHTTPRequestHandler):
                             sim_state["speed"] = max(1, min(300, int(data.get("speed", 50))))
                         elif action == "set_tenant":
                             sim_state["tenant"] = data.get("tenant", "gracko")
+                            stop_event.set()
                         elif action == "set_corrida":
                             sim_state["corrida"] = int(data.get("corrida", 0))
                         elif action == "restart":
@@ -506,6 +509,16 @@ def simulation_worker():
             }
 
         logger.info("▶ Dashboard simulator started for tenant: %s (corrida=%s)", tenant, corrida or "base")
+
+        # A newly registered company can be backed by live LoRa devices instead
+        # of one of the historical CSV tenants. Keep the simulator worker idle
+        # while the serial bridge feeds /api/lora-alert.
+        if tenant == "lora_real":
+            logger.info("▶ Esperando alertas LoRa para la nueva empresa")
+            while not stop_event.is_set():
+                time.sleep(0.5)
+            continue
+
         analyzer = TrendAnalyzer()
         context_filter = create_context_filter(provider="offline", corrida_num=corrida if corrida > 0 else None)
         dispatcher = WebhookDispatcher(dry_run=False)
@@ -529,6 +542,8 @@ def simulation_worker():
 
                 # Trend analysis
                 anomalies = analyzer.analyze(point)
+                verdicts = [(anomaly, context_filter.evaluate(anomaly)) for anomaly in anomalies]
+                pending_alerts: list[VerifiedAlert] = []
 
                 with state_lock:
                     sim_state["current_point"] = {
@@ -546,8 +561,7 @@ def simulation_worker():
 
                     sim_state["stats"]["processed"] += 1
 
-                    for a in anomalies:
-                        verdict = context_filter.evaluate(a)
+                    for a, verdict in verdicts:
                         sim_state["stats"]["anomalies"] += 1
                         if verdict.is_real_incident:
                             sim_state["stats"]["real"] += 1
@@ -574,11 +588,14 @@ def simulation_worker():
                                 llm_reasoning=verdict.reasoning,
                                 description=a.description,
                             )
-                            threading.Thread(
-                                target=_dispatch_dashboard_alert,
-                                args=(dispatcher, alert),
-                                daemon=True,
-                            ).start()
+                            pending_alerts.append(alert)
+
+                for alert in pending_alerts:
+                    threading.Thread(
+                        target=_dispatch_dashboard_alert,
+                        args=(dispatcher, alert),
+                        daemon=True,
+                    ).start()
 
                 # Regulate speed
                 speed = sim_state["speed"]
@@ -598,7 +615,7 @@ def _dispatch_dashboard_alert(dispatcher: WebhookDispatcher, alert: VerifiedAler
 
 def start_dashboard(port: int = 8080):
     """Start the dashboard server and background simulator."""
-    server = HTTPServer(("0.0.0.0", port), DashboardRequestHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), DashboardRequestHandler)
     sim_thread = threading.Thread(target=simulation_worker, daemon=True)
     sim_thread.start()
 

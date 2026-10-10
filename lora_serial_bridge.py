@@ -1,10 +1,12 @@
 """Bridge for the current LoRa serial alert protocol.
 
 Reads lines emitted by Receptor.py / the Heltec master:
-    ALERTA_SERVER|SRV_LAPTOP_1|CPU del servidor en estado critico|85.0
+    ALERTA_SERVER|laptop_1|CPU del servidor en estado critico|85.0
+    ALERTA_SERVER|laptop_2|Latencia alta|120.0
 
-For the first hardware test, each LoRa alert is converted into a verified
-Centinel alert and sent to n8n. It is also forwarded to the local dashboard.
+Each LoRa alert is converted into a verified Centinel alert and sent to n8n.
+The emitter ID is preserved so alerts from multiple laptops can be identified
+in the local dashboard.
 """
 
 from __future__ import annotations
@@ -84,6 +86,8 @@ def update_dashboard(payload: dict) -> None:
             "confidence": payload["llm_confidence"],
             "description": payload["description"],
             "reasoning": payload["llm_reasoning"],
+            "source_device": payload["source_device"],
+            "temperature": payload["temperature"],
         }, timeout=2)
     except requests.RequestException:
         logger.warning("Dashboard no disponible; la alerta se conserva en n8n.")
